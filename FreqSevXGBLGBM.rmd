@@ -1,0 +1,568 @@
+---
+title: |
+ <b><div style="text-align: center"> Frecuency and Severity Models with Xgboost and LightGBM </div></b>
+author:  
+ name: Rubén Herrera Giménez
+date: November 2021
+output: 
+  rmdformats::readthedown:
+    code_folding: hide
+css: customRHG.css
+---
+
+
+# Introduction
+
+From December 2020 to March 2021, the *Insurance Pricing Game* competition took place on the AIcrowd platform organised by Imperial College London.
+
+I had the opportunity to participate, learning a lot about applying predictive modelling to actuarial pricing. 
+
+In this document I show what was my best submission for the RMSE-based ranking between the pure premiums output from the participants' models and the actual claims from a hidden dataset. 
+
+The most interesting point is the use of the *lightgbm* library in R, for the severity model. A recent library much faster than *xgboost* and in some cases with better results.
+
+For more information on how the competition works: https://www.aicrowd.com/challenges/insurance-pricing-game.
+
+# Packages and options
+
+The packages are loaded and the necessary options are set. 
+
+```{r Pack&Opt, message=FALSE, warning=FALSE}
+
+
+enable_packages <- function(x){
+  for( i in x ){
+    if( ! require( i , character.only = TRUE ) ){
+      install.packages( i , dependencies = TRUE )
+      require( i , character.only = TRUE )
+    }
+  }
+}
+
+enable_packages(c("data.table","tidyverse", "knitr", "reactable", "caret", "xgboost", "lightgbm"))
+
+options(scipen = 999)
+
+
+```
+
+
+# Data
+
+As mentioned in the introduction, the data used for this example is from the *Insurance Pricing Game* competition on the AIcrowd platform. 
+
+This data has around 240K observations, of which approximately 60K are from each of the 4 years available in the dataset. 
+
+The target variable is *claim_amount*, which is the total amount paid out in a year for each policy for all claims made. As such, unlike in other cases we do not have the traceability of the number of claims, but it is the total annual claim value. 
+
+The raw data for year 1 is loaded and displayed as an example:
+
+```{r data, message=FALSE, warning=FALSE}
+
+dataRaw <- as.data.frame(fread("Inputs/AIcrowd_InsurancePricingGame_trainingCap.csv"))
+
+dataRaw %>%
+  filter(year == 1) %>%
+  relocate(claim_amount, .after=year) %>% 
+  reactable(
+           bordered = TRUE,
+           filterable = FALSE,
+           resizable = TRUE,
+           searchable = TRUE,
+           showPageSizeOptions = TRUE,
+           defaultPageSize = 10,
+           pageSizeOptions = c(5, 10, 20, 50, 100),
+           borderless = FALSE,
+           highlight = TRUE, 
+           outlined = TRUE,
+           showSortIcon = TRUE,
+           showSortable = TRUE,
+           width= "100%",
+    defaultColDef = colDef(
+      width = 115,
+      align = "center",
+      headerStyle = "background: black; color: white;",
+      style = "background: #F2F3F4;"
+    ),
+    columns = list(
+      claim_amount  = colDef(
+        headerStyle = "background: gold; color: black;",
+        style = "background: #FEF9E7;",
+        class = "border-left"
+      )
+    ))
+
+```
+
+
+# Pre-processing
+
+The pre-processing is done differently for the frequency and severity models, depending on the previous analyses performed. 
+
+In favour of efficiency, they are integrated into the same function and then each set will be used to calibrate the corresponding model. 
+
+For pre-processing, the target variable is separated from the rest of the variables.
+
+As an example, the first 1000 observations for the frequency model are shown. 
+
+```{r preprocessing, message=FALSE, warning=FALSE}
+
+Xdata = within(dataRaw, rm('claim_amount'))
+ydata = dataRaw['claim_amount']
+
+preprocess_X_data <- function (x_raw){
+  
+  preprocess_X_data_XGB <- function (x_raw){
+
+    X_clean <- x_raw
+    
+    
+    # Pre-processing
+    
+    #### pol_payd: binary (1 & 0)
+    X_clean <-  X_clean %>% 
+      dplyr::mutate( pol_payd = ifelse( pol_payd=="Yes",1,0)) 
+    
+    #### pol_usage: One Hot Encoding at the end
+    
+    #### drv_sex1: binary (1 & 0)
+    
+    X_clean <-  X_clean %>% 
+      dplyr::mutate( drv_sex1 = ifelse( drv_sex1=="M",1,0)) 
+    
+    #### drv_drv2: binary (1 & 0)
+    X_clean <-  X_clean %>% 
+      dplyr::mutate( drv_drv2 = ifelse( drv_drv2=="Yes",1,0)) 
+    
+    sapply(X_clean, function(x) length(unique(x)))
+    unique(X_clean$drv_drv2)
+    
+    #### drv_sex2: One Hot Encoding at the end
+    
+    #### drv_age2 y drv_age_lic2: impute NAs with 0.
+    
+    X_clean <- X_clean %>% 
+      dplyr::mutate(drv_age2 = replace_na(drv_age2, 0),
+                    drv_age_lic2 = replace_na(drv_age_lic2, 0)) 
+    
+    
+    #### vh_make_model: We change levels by frequency with function
+    
+    feLevelsToFreq  <- function(data, byName=T, nomChangeVars, prefix="freq", 
+                                typeOutput=c("data.frame","data.table")){
+      
+      
+      # If it is provided a tibble or data.table object is passed to data.frame
+      data <- as.data.frame(data)
+      
+      #Variables to change are selected depending on user selection, provided by user or all text variables
+      
+      if(byName==T){nomChangeVars<-nomChangeVars}else{
+        nomChangeVars<-colnames(Filter(function(x){is.character(x)|is.factor(x)},
+                                       data)) }
+      
+      # NAs are included as a new level
+      
+      data[,nomChangeVars]<-sapply(data[,nomChangeVars], function(x){ifelse(is.na(x),"NA",x)})
+      
+      #Convert into a data.table object
+      
+      dataDt<-as.data.table(data)
+      
+      #Change levels by frecuencies 
+      for(i in 1:length(nomChangeVars)){
+        
+        dataDt[,paste(prefix,nomChangeVars[i],sep=""):=.N, by=c(nomChangeVars[i])]
+      }
+      
+      #Type of output
+      if(typeOutput=="data.frame"){data<-as.data.frame(dataDt)}else{data<-data}
+      
+      #Delete or old variables
+      
+      if(prefix!=""){
+        return(data %>% dplyr::select(-nomChangeVars))
+      }else{
+        return(data)
+      }
+      
+      
+    }
+    
+    X_clean <- feLevelsToFreq(data=X_clean, byName=T, nomChangeVars=c("vh_make_model"), prefix="", 
+                              typeOutput="data.frame")
+    
+    # Returns type text, is changed
+    X_clean$vh_make_model <- as.numeric(X_clean$vh_make_model)
+    
+    #### vh_age: Impute NA by the median 
+    
+    if(sum(is.na(X_clean$vh_age))>0){
+      
+      vecReplaceVh_ageNA <- NULL
+      
+      for(i in 1:nrow(X_clean[is.na(X_clean$vh_age),])){
+        
+        vecReplaceVh_ageNA <- c(vecReplaceVh_ageNA,
+                                
+                                if(!is.na(as.numeric(X_clean %>%
+                                                     dplyr::filter(vh_make_model == X_clean[is.na(X_clean$vh_age),][i,"vh_make_model"],
+                                                                   year == X_clean[is.na(X_clean$vh_age),][i,"year"]) %>%
+                                                     dplyr::summarise(Median_vh_age = median(vh_age, na.rm=T))))){
+                                  
+                                  as.numeric(X_clean %>%
+                                               dplyr::filter(vh_make_model == X_clean[is.na(X_clean$vh_age),][i,"vh_make_model"],
+                                                             year == X_clean[is.na(X_clean$vh_age),][i,"year"]) %>%
+                                               dplyr::summarise(Median_vh_age = median(vh_age, na.rm=T)))
+                                }else{
+                                  
+                                  as.numeric(X_clean %>%
+                                               dplyr::filter(year == X_clean[is.na(X_clean$vh_age),][i,"year"]) %>%
+                                               dplyr::summarise(Median_vh_age = median(vh_age, na.rm=T)))
+                                  
+                                }
+                                
+        )
+        
+      }
+      
+      
+      X_clean[is.na(X_clean$vh_age),][,"vh_age"] <- vecReplaceVh_ageNA
+    }
+    
+    #### vh_fuel: One Hot Encoding at the end
+    
+    
+    
+    #### vh_type: binary (1 & 0)
+    
+    X_clean <-  X_clean %>% 
+      dplyr::mutate( vh_type = ifelse( vh_type == "Tourism",1,0)) 
+    
+    
+    #### vh_speed, vh_value y  vh__weight: NAs and NAs miscoded in weight
+    # Errors are inputted by the median
+    
+    imputeMedian <- function(x){replace(x, is.na(x), median(x, na.rm = TRUE))}
+    
+    X_clean <- X_clean %>%
+      group_by(vh_type, vh_fuel) %>%
+      dplyr::mutate(
+        vh_speed = imputeMedian(vh_speed),
+        vh_value = imputeMedian(vh_value),  
+        vh_weight = imputeMedian(vh_weight)
+      ) 
+    
+  
+    #### ONE HOT ENCODING
+    
+    X_clean <- X_clean %>% 
+      select(-c("id_policy", "year"))
+    
+    X_clean<-data.frame(predict(dummyVars(" ~ .", data=X_clean), newdata = X_clean))
+    
+    # We eliminate the variable drv_sex20 as the information is already implicit in drv_drv2
+    X_clean$drv_sex20 <- NULL
+    
+    # We eliminate the variables that do not provide information and transform the variables of age of licence
+    X_clean <- X_clean  %>%
+      mutate(drv_age_lic1 = drv_age_lic1^2,
+             drv_age_lic2 = drv_age_lic2^2)
+    
+    # ---------------------------------------------------------------------
+    return(X_clean) 
+  }
+  
+  preprocess_X_data_LGB <- function (x_raw){
+   
+    X_clean <- x_raw
+    
+    
+     # Pre-processing
+    
+    #### drv_age2 y drv_age_lic2: change NAs with 0.
+    
+    X_clean <- X_clean %>% 
+      dplyr::mutate(drv_age2 = replace_na(drv_age2, 0),
+                    drv_age_lic2 = replace_na(drv_age_lic2, 0)) 
+    
+    
+    #### vh_make_model: We change levels by frequency with function
+    
+    feLevelsToFreq  <- function(data, byName=T, nomChangeVars, prefix="freq", 
+                                typeOutput=c("data.frame","data.table")){
+      
+      
+      # If it is provided a tibble or data.table object is passed to data.frame
+      data <- as.data.frame(data)
+      
+      #Variables to change are selected depending on user selection, provided by user or all text variables
+      
+      if(byName==T){nomChangeVars<-nomChangeVars}else{
+        nomChangeVars<-colnames(Filter(function(x){is.character(x)|is.factor(x)},
+                                       data)) }
+      
+      # NAs are included as a new level
+      
+      data[,nomChangeVars]<-sapply(data[,nomChangeVars], function(x){ifelse(is.na(x),"NA",x)})
+      
+      #Convert into a data.table object
+      
+      dataDt<-as.data.table(data)
+      
+      #Change levels by frecuencies 
+      for(i in 1:length(nomChangeVars)){
+        
+        dataDt[,paste(prefix,nomChangeVars[i],sep=""):=.N, by=c(nomChangeVars[i])]
+      }
+      
+      #Type of output
+      if(typeOutput=="data.frame"){data<-as.data.frame(dataDt)}else{data<-data}
+      
+      #Delete or old variables
+      
+      if(prefix!=""){
+        return(data %>% dplyr::select(-nomChangeVars))
+      }else{
+        return(data)
+      }
+      
+      
+    }
+    
+    
+    X_clean <- feLevelsToFreq(data=X_clean, byName=T, nomChangeVars=c("vh_make_model"), prefix="", 
+                              typeOutput="data.frame")
+    
+    X_clean$vh_make_model <- as.numeric(X_clean$vh_make_model)
+    
+    #### vh_age: 
+    
+    if(sum(is.na(X_clean$vh_age))>0){
+      
+      vecReplaceVh_ageNA <- NULL
+      
+      for(i in 1:nrow(X_clean[is.na(X_clean$vh_age),])){
+        
+        vecReplaceVh_ageNA <- c(vecReplaceVh_ageNA,
+                                
+                                if(!is.na(as.numeric(X_clean %>%
+                                                     dplyr::filter(vh_make_model == X_clean[is.na(X_clean$vh_age),][i,"vh_make_model"],
+                                                                   year == X_clean[is.na(X_clean$vh_age),][i,"year"]) %>%
+                                                     dplyr::summarise(Median_vh_age = median(vh_age, na.rm=T))))){
+                                  
+                                  as.numeric(X_clean %>%
+                                               dplyr::filter(vh_make_model == X_clean[is.na(X_clean$vh_age),][i,"vh_make_model"],
+                                                             year == X_clean[is.na(X_clean$vh_age),][i,"year"]) %>%
+                                               dplyr::summarise(Median_vh_age = median(vh_age, na.rm=T)))
+                                }else{
+                                  
+                                  as.numeric(X_clean %>%
+                                               dplyr::filter(year == X_clean[is.na(X_clean$vh_age),][i,"year"]) %>%
+                                               dplyr::summarise(Median_vh_age = median(vh_age, na.rm=T)))
+                                  
+                                }
+                                
+        )
+        
+      }
+      
+      
+      X_clean[is.na(X_clean$vh_age),][,"vh_age"] <- vecReplaceVh_ageNA
+    }
+    
+    #### vh_fuel: One Hot Encoding at the end
+    
+    #### vh_speed, vh_value y  vh__weight: NAs and NAs miscoded in weight
+    # Errors are inputted by the median
+    
+    imputeMedian <- function(x){replace(x, is.na(x), median(x, na.rm = TRUE))}
+    
+    X_clean <- X_clean %>%
+      group_by(vh_type, vh_fuel) %>%
+      dplyr::mutate(
+        vh_speed = imputeMedian(vh_speed),
+        vh_value = imputeMedian(vh_value),  
+        vh_weight = imputeMedian(vh_weight)
+      ) 
+    
+    # We eliminate the variables that do not provide information and transform the variables of age of licence
+    
+    X_clean <- X_clean %>% 
+      select(-c("id_policy", "year")) %>%
+      mutate(drv_age_lic1 = drv_age_lic1^2,
+             drv_age_lic2 = drv_age_lic2^2)
+    
+
+    
+    return(X_clean) 
+  }
+  
+  x_clean <- list()
+  
+  x_clean[[1]] <- preprocess_X_data_XGB(x_raw)
+  x_clean[[2]] <-preprocess_X_data_LGB(x_raw) 
+  
+  return(x_clean)
+  
+}
+
+preprocess_X_data(Xdata)[[1]]  %>% 
+  reactable(
+           bordered = TRUE,
+           filterable = FALSE,
+           resizable = TRUE,
+           searchable = TRUE,
+           showPageSizeOptions = TRUE,
+           defaultPageSize = 10,
+           pageSizeOptions = c(5, 10, 20, 50, 100),
+           borderless = FALSE,
+           highlight = TRUE, 
+           outlined = TRUE,
+           showSortIcon = TRUE,
+           showSortable = TRUE,
+           width= "100%",
+    defaultColDef = colDef(
+      width = 115,
+      align = "center",
+      headerStyle = "background: black; color: white;",
+      style = "background: #F2F3F4;"
+    )) 
+```
+
+
+
+# Calibration of models
+
+For the calibration of the models, a function is also used, in which the pre-processing function is introduced.
+
+As for the parameters chosen for each model. These were chosen through a process of parameter tuning using Bayesian techniques using the *mlr* library and other annexed libraries. 
+
+```{r calibration, message = FALSE, warning=FALSE}
+
+fit_model <- function (x_raw, y_raw){
+  
+  x_clean = preprocess_X_data(x_raw)  
+  x_clean_XGB <- x_clean[[1]]
+  x_clean_LGB <- x_clean[[2]]
+  
+  #### Frecuency
+  targetFreq <- as.numeric(ifelse(y_raw > 0, 1, 0))
+  
+  dfXGBoost <-  xgboost::xgb.DMatrix(data.matrix(x_clean_XGB%>% select(-c( "pol_usageAllTrips", "vh_fuelHybrid"))), label=targetFreq)
+
+  
+  set.seed(1234)
+  
+  trained_model_frequency = xgboost::xgboost(data = dfXGBoost, booster="gbtree", eta = 0.02, gamma=4.736642, max_depth = 8,  
+                                             min_child_weight = 	8.25592, subsample = 	0.784608, colsample_bytree = 0.3386966,
+                                             colsample_bylevel = 0.3319833, lambda = 4.527404, alpha = 1.870129, max_delta_step= 8,
+                                             nrounds = 450, objective = "binary:logistic", eval_metric="logloss",
+                                             verbose=0, maximize = FALSE, nthread = 8)
+
+  
+  #### Severidad
+  targetSev <- as.numeric(ydata[ydata>0])
+  
+  dfLightXGBSev<- lgb.Dataset(data.matrix(x_clean_LGB[ydata>0,]%>% select(-c("pol_pay_freq","vh_type","drv_age2"))), label=targetSev)
+  
+  lgb.gridSev <- list(boosting = "gbdt", 
+                      learning_rate = 0.01, 
+                      min_gain_to_split = 2.5, 
+                      max_depth = 2,  
+                      bagging_fraction = 	0.8343508, 
+                      feature_fraction = 0.7227348,
+                      lambda_l2 = 3.256435, 
+                      lambda_l1 = 1.454468, 
+                      num_iterations = 480,
+                      num_leaves = 3)
+  
+  
+  set.seed(1234)
+  trained_model_severity = lgb.train(data = dfLightXGBSev, params = lgb.gridSev,
+                                     num_threads = 4, objective = "regression_l2", 
+                                     metric="rmse")
+  
+  # defining a list and putting the trained models in there
+  trained_model = list(occurence = trained_model_frequency,
+                       cost = trained_model_severity)
+  
+  # ---------------------------------------------------------------------
+  # The result trained_model is something that you will save in the next section
+  return(trained_model)
+}
+
+model = fit_model(Xdata, ydata)
+
+str(model)
+
+```
+# Pure premium 
+
+We then derive the pure premium as the product of frequency and expected severity. 
+
+In this example we make the prediction on the same calibration data as an example. In the competition, the model had to be uploaded to the platform and the prediction was made on hidden data.
+
+```{r pure, message = FALSE, warning=FALSE}
+
+predict_expected_claim <- function(model, x_raw){
+
+  x_clean = preprocess_X_data(x_raw)  
+  x_clean_XGB <- x_clean[[1]]
+  x_clean_LGB <- x_clean[[2]]
+  
+  expected_frequency = predict(model$occurence, newdata = data.matrix(x_clean_XGB %>% select(-c( "pol_usageAllTrips", "vh_fuelHybrid"))), type= "response")
+  expected_severity = predict(model$cost, data = data.matrix(x_clean_LGB %>% select(-c("pol_pay_freq", "vh_type","drv_age2"))))
+  
+  expected_claims = expected_frequency * expected_severity
+  
+  dfExpected <- data.frame(expected_frequency = expected_frequency,
+                           expected_severity = expected_severity,
+                           expected_claims = expected_claims)
+  
+  return(dfExpected)  
+}
+
+finalResult <- predict_expected_claim(model, Xdata)
+
+finalResult %>% 
+  reactable(
+           bordered = TRUE,
+           filterable = FALSE,
+           resizable = TRUE,
+           searchable = TRUE,
+           showPageSizeOptions = TRUE,
+           defaultPageSize = 10,
+           pageSizeOptions = c(5, 10, 20, 50, 100),
+           borderless = FALSE,
+           highlight = TRUE, 
+           outlined = TRUE,
+           showSortIcon = TRUE,
+           showSortable = TRUE,
+    defaultColDef = colDef(
+      width = 260,
+      align = "center",
+      headerStyle = "background: black; color: white;",
+      style = "background: #F2F3F4;"
+    ))
+
+```
+The competition was made more complex by having to add a pricing strategy. But in this case study we have seen how to apply a combination of *xgboost* and *lightgbm* to calculate the pure premium with real data. 
+
+Finally, we export the results, if necessary.
+
+```{r export, message = FALSE, warning=FALSE}
+
+fwrite(finalResult, "Outputs/purePremiumFinalResult.csv")
+
+```
+
+# Session information
+
+To encourage replicability: 
+
+```{r message = FALSE, warning=FALSE}
+
+sessionInfo()
+
+```

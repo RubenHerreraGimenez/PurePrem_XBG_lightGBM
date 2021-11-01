@@ -1,0 +1,104 @@
+h1, h2, h3, h4, h5, h6, legend {
+    color: #333333;
+    text-align: center;
+}
+
+p {
+  text-align: justify;
+}
+
+#sidebar h2 {
+    z-index: 200;
+    background-color: #6986bf;
+    text-align: center;
+    padding: 0.809em;
+    display: block;
+    color: #ffffff;
+    font-size: 100%;
+    margin-top: 0px;
+    margin-bottom: 0.809em;
+}
+
+#sidebar {
+    background-color:#ccddff;
+    width: 20%;
+}
+
+#toc ul.nav > li > a {
+    color: #ffffff;
+}
+
+#toc ul.nav li.active ul li.active a {
+    color: #ffffff;
+    font-weight: bold !important;
+}
+
+#toc ul.nav > li.active > a {
+    color: #ffffff !important;
+}
+
+#sidebar a:hover {
+    background-color: #6986bf;
+    cursor: pointer;
+}
+
+
+#toc ul.nav li.active ul li a {
+    background-color: #ccddff;
+    color: #333333;
+    border-right: solid 1px #6986bf;
+    font-weight: bold;
+}
+
+#toc ul.nav li.active a {
+    color: #ffffff;
+    font-weight: bold;
+    background-color: #6986bf;
+    font-weight: bold;
+}
+
+#toc ul.nav li ul li a {
+    background-color: #ccddff;
+    color: #333333;
+    border-right: solid 1px #6986bf;
+    font-weight: bold;
+}
+
+#toc ul.nav li.active ul li.active a {
+    background-color: #6986bf;
+    color: #ffffff;
+    font-weight: bold;
+}
+
+#toc ul.nav li a {
+    color: #333333;
+    font-weight: bold;
+    background-color: #ccddff;
+}
+
+#content {
+    background: #fcfcfc;
+    height: 100%;
+    margin-left: 20%;
+    width: 100%;
+    margin-right: 0px;
+    padding: 1em 2em;
+
+}
+
+table{
+
+margin: 0 auto;
+
+}
+
+#postamble {
+    color: #ffffff;
+    background: #6986bf;
+    border-top: solid 0px #6986bf;
+    font-family: "Lato","proxima-nova","Helvetica Neue",Arial,sans-serif;
+    font-size: 90%;
+    z-index: 400;
+    padding: 12px;
+    width: 400px;
+}
